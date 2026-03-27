@@ -1,333 +1,148 @@
 import os
-import io
-from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance
+import asyncio
 from pyrogram import Client, filters
 from pyrogram.types import Message
-import requests
-from io import BytesIO
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
-# Bot credentials
-API_ID = os.getenv("API_ID")
-API_HASH = os.getenv("API_HASH")
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
+# --- Configuration ---
+API_ID = os.environ.get("API_ID") 
+API_HASH = os.environ.get("API_HASH") 
+BOT_TOKEN = os.environ.get("BOT_TOKEN") 
+ADMIN_ID = os.environ.get("ADMIN_ID") # Your numeric user ID
 
-app = Client("thumbnail_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client("thumb_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# User states for multi-step process
-user_states = {}
+# Store what step the admin is currently on
+# Steps: 0=Idle, 1=Waiting for BG, 2=Waiting for Left, 3=Waiting for Right
+admin_sessions = {}
 
-class ThumbnailState:
-    def __init__(self):
-        self.anime_name = None
-        self.background = None
-        self.right_thumbnail = None
-        self.left_thumbnail = None
-
-
-def download_font():
-    """Download Poppins Bold font if not exists"""
-    font_path = "/tmp/Poppins-Bold.ttf"
-    if not os.path.exists(font_path):
-        url = "https://github.com/google/fonts/raw/main/ofl/poppins/Poppins-Bold.ttf"
-        response = requests.get(url)
-        with open(font_path, "wb") as f:
-            f.write(response.content)
-    return font_path
-
-
-def get_dominant_color(image):
-    """Get dominant color from image for theme matching"""
-    img = image.copy()
-    img = img.resize((150, 150))
-    pixels = img.getdata()
-    
-    # Get most common color
-    colors = {}
-    for pixel in pixels:
-        if isinstance(pixel, int):
-            continue
-        rgb = pixel[:3] if len(pixel) >= 3 else pixel
-        colors[rgb] = colors.get(rgb, 0) + 1
-    
-    if colors:
-        dominant = max(colors.items(), key=lambda x: x[1])[0]
-        return dominant
-    return (33, 150, 243)  # Default blue
-
-
-def create_phone_mockup(image, size=(280, 560)):
-    """Create phone mockup effect with rounded corners"""
-    img = image.copy()
-    img = img.resize(size, Image.Resampling.LANCZOS)
-    
-    # Create rounded rectangle mask
-    mask = Image.new('L', size, 0)
-    draw = ImageDraw.Draw(mask)
-    draw.rounded_rectangle([(0, 0), size], radius=30, fill=255)
-    
-    # Apply mask
-    output = Image.new('RGBA', size, (0, 0, 0, 0))
-    output.paste(img, (0, 0))
-    output.putalpha(mask)
-    
-    # Add phone frame
-    frame = Image.new('RGBA', (size[0] + 20, size[1] + 20), (0, 0, 0, 0))
-    frame_draw = ImageDraw.Draw(frame)
-    frame_draw.rounded_rectangle([(0, 0), (size[0] + 20, size[1] + 20)], 
-                                  radius=35, outline=(40, 40, 40), width=8)
-    
-    # Composite
-    result = Image.new('RGBA', (size[0] + 20, size[1] + 20), (0, 0, 0, 0))
-    result.paste(frame, (0, 0), frame)
-    result.paste(output, (10, 10), output)
-    
-    return result
-
-
-def create_frosted_button(text, size, color):
-    """Create frosted glass button effect"""
-    img = Image.new('RGBA', size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    
-    # Semi-transparent background with color tint
-    bg_color = (*color, 120)
-    draw.rounded_rectangle([(0, 0), size], radius=15, fill=bg_color)
-    
-    # Border glow
-    draw.rounded_rectangle([(0, 0), size], radius=15, 
-                          outline=(*color, 200), width=2)
-    
-    # Text
-    try:
-        font_path = download_font()
-        font = ImageFont.truetype(font_path, 28)
-    except:
-        font = ImageFont.load_default()
-    
-    # Center text
-    bbox = draw.textbbox((0, 0), text, font=font)
-    text_width = bbox[2] - bbox[0]
-    text_height = bbox[3] - bbox[1]
-    x = (size[0] - text_width) // 2
-    y = (size[1] - text_height) // 2
-    
-    # Text with shadow
-    draw.text((x+2, y+2), text, fill=(0, 0, 0, 150), font=font)
-    draw.text((x, y), text, fill=(255, 255, 255, 255), font=font)
-    
-    return img
-
-
-def create_thumbnail(anime_name, bg_image, right_img, left_img):
-    """Main thumbnail creation function"""
-    
-    # Canvas size
-    width, height = 1280, 720
-    canvas = Image.new('RGBA', (width, height), (0, 0, 0, 255))
-    
-    # 1. Background - blurred
-    background = bg_image.copy()
-    background = background.resize((width, height), Image.Resampling.LANCZOS)
-    background = background.filter(ImageFilter.GaussianBlur(radius=15))
-    
-    # Darken background
-    enhancer = ImageEnhance.Brightness(background)
-    background = enhancer.enhance(0.4)
-    
-    canvas.paste(background, (0, 0))
-    
-    # Get theme color from right thumbnail
-    theme_color = get_dominant_color(right_img)
-    
-    # 2. Right thumbnail with dark overlay
-    right_thumbnail = right_img.copy()
-    right_thumbnail = right_thumbnail.resize((580, 650), Image.Resampling.LANCZOS)
-    
-    # Create dark overlay
-    overlay = Image.new('RGBA', right_thumbnail.size, (0, 0, 0, 140))
-    right_thumbnail = Image.alpha_composite(
-        right_thumbnail.convert('RGBA'), 
-        overlay
-    )
-    
-    # Position right thumbnail
-    right_x = width - 600
-    right_y = 35
-    canvas.paste(right_thumbnail, (right_x, right_y), right_thumbnail)
-    
-    # 3. Left character in phone mockup
-    phone_mockup = create_phone_mockup(left_img)
-    phone_x = 40
-    phone_y = (height - phone_mockup.height) // 2
-    canvas.paste(phone_mockup, (phone_x, phone_y), phone_mockup)
-    
-    # 4. Title section
+# --- Image Generation Logic ---
+def create_thumbnail(name, bg_path, left_path, right_path, output_path):
+    # Canvas Settings
+    WIDTH, HEIGHT = 1280, 720
+    canvas = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 255))
     draw = ImageDraw.Draw(canvas)
-    
+
+    # 1. Background (Blurred and darkened slightly)
+    bg = Image.open(bg_path).convert("RGBA").resize((WIDTH, HEIGHT))
+    bg = bg.filter(ImageFilter.GaussianBlur(3))
+    bg_overlay = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 100)) # Dark tint
+    canvas.paste(bg, (0, 0))
+    canvas.paste(bg_overlay, (0, 0), bg_overlay)
+
+    # 2. Right Anime Thumbnail (with rounded corners)
+    right_img = Image.open(right_path).convert("RGBA").resize((750, 420))
+    right_mask = Image.new("L", right_img.size, 0)
+    ImageDraw.Draw(right_mask).rounded_rectangle((0, 0, right_img.size[0], right_img.size[1]), 20, fill=255)
+    canvas.paste(right_img, (480, 160), right_mask)
+
+    # 3. Left Character Image (with rounded corners)
+    left_img = Image.open(left_path).convert("RGBA").resize((400, 660))
+    left_mask = Image.new("L", left_img.size, 0)
+    ImageDraw.Draw(left_mask).rounded_rectangle((0, 0, left_img.size[0], left_img.size[1]), 30, fill=255)
+    canvas.paste(left_img, (40, 30), left_mask)
+
+    # 4. Load Fonts (Using the ones you uploaded)
     try:
-        font_path = download_font()
-        title_font = ImageFont.truetype(font_path, 72)
-        subtitle_font = ImageFont.truetype(font_path, 42)
-    except:
+        title_font = ImageFont.truetype("fonts/font.ttf", 65)
+        subtitle_font = ImageFont.truetype("fonts/DejaVuSansCondensed-Bold.ttf", 35)
+        button_font = ImageFont.truetype("fonts/DejaVuSansCondensed-Bold.ttf", 25)
+    except OSError:
+        print("Fonts not found! Make sure they are in the 'fonts' folder. Using defaults.")
         title_font = ImageFont.load_default()
         subtitle_font = ImageFont.load_default()
-    
-    # Anime name (top)
-    title_upper = anime_name.upper()
-    
-    # Create text with stroke
-    title_x = 370
-    title_y = 100
-    
-    # Stroke effect
-    for adj in range(-3, 4):
-        for adj2 in range(-3, 4):
-            draw.text((title_x+adj, title_y+adj2), title_upper, 
-                     fill=(0, 0, 0, 180), font=title_font)
-    
-    # Main text with theme color gradient simulation
-    draw.text((title_x, title_y), title_upper, 
-             fill=(255, 255, 255, 255), font=title_font)
-    
-    # "KENSHIN ANIME" branding
-    branding_y = title_y + 90
-    draw.text((title_x+2, branding_y+2), "KENSHIN ANIME", 
-             fill=(0, 0, 0, 200), font=subtitle_font)
-    draw.text((title_x, branding_y), "KENSHIN ANIME", 
-             fill=theme_color, font=subtitle_font)
-    
-    # 5. Bottom buttons
-    button_y = height - 100
-    
-    # Watch Now button
-    watch_btn = create_frosted_button("WATCH NOW", (280, 70), theme_color)
-    canvas.paste(watch_btn, (370, button_y), watch_btn)
-    
-    # Kenshin Anime button
-    kenshin_btn = create_frosted_button("KENSHIN ANIME", (280, 70), theme_color)
-    canvas.paste(kenshin_btn, (670, button_y), kenshin_btn)
-    
-    # 6. Add accent lines/decoration
-    draw.line([(360, title_y - 20), (width - 50, title_y - 20)], 
-             fill=(*theme_color, 200), width=3)
-    
-    return canvas.convert('RGB')
+        button_font = ImageFont.load_default()
 
+    # 5. Add Texts
+    # Main Anime Title
+    draw.text((480, 30), name.upper(), font=title_font, fill="white")
+    # Subtitle (KENSHIN ANIME)
+    draw.text((480, 100), "KENSHIN ANIME", font=subtitle_font, fill="#FFD700") # Yellow/Gold
 
+    # 6. Buttons
+    btn_y = 620
+    buttons = [("WATCH NOW", 480), ("KENSHIN ANIME", 820)]
+    
+    for text, x_pos in buttons:
+        # Button Background
+        draw.rounded_rectangle((x_pos, btn_y, x_pos + 300, btn_y + 70), radius=15, fill="#1A1A1A", outline="#333333", width=2)
+        # Button Text (Centered)
+        text_bbox = draw.textbbox((0, 0), text, font=button_font)
+        text_w = text_bbox[2] - text_bbox[0]
+        text_h = text_bbox[3] - text_bbox[1]
+        text_x = x_pos + (300 - text_w) / 2
+        text_y = btn_y + (70 - text_h) / 2 - 5
+        draw.text((text_x, text_y), text, font=button_font, fill="white")
+
+    # Save final image
+    canvas.save(output_path, "PNG")
+    return output_path
+
+# --- Bot Handlers ---
 @app.on_message(filters.command("start") & filters.private)
-async def start(client, message: Message):
-    if message.from_user.id not in ADMIN_IDS:
-        await message.reply("❌ Unauthorized! This bot is admin-only.")
+async def start_cmd(client, message: Message):
+    if str(message.from_user.id) != ADMIN_ID:
+        return await message.reply("Bro, this is a private admin bot.")
+    
+    await message.reply("🔥 **Thumbnail Maker Ready!** 🔥\n\nSend me the **Anime Name** to start.")
+
+@app.on_message(filters.text & filters.private & ~filters.command("start"))
+async def get_name(client, message: Message):
+    if str(message.from_user.id) != ADMIN_ID:
         return
     
-    await message.reply(
-        "🎨 **Kenshin Anime Thumbnail Generator**\n\n"
-        "Use /create <anime_name> to start creating a thumbnail!\n\n"
-        "Example: `/create Fullmetal Alchemist`"
-    )
-
-
-@app.on_message(filters.command("create") & filters.private)
-async def create_command(client, message: Message):
-    if message.from_user.id not in ADMIN_IDS:
-        await message.reply("❌ Unauthorized!")
-        return
-    
-    # Extract anime name
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        await message.reply("❌ Usage: /create <anime_name>")
-        return
-    
-    anime_name = parts[1].strip()
-    
-    # Initialize state
-    user_states[message.from_user.id] = ThumbnailState()
-    user_states[message.from_user.id].anime_name = anime_name
-    
-    await message.reply(
-        f"✅ Creating thumbnail for: **{anime_name}**\n\n"
-        f"📤 Now send the **background image** (anime scene that will be blurred)"
-    )
-
+    admin_sessions[ADMIN_ID] = {
+        "step": 1,
+        "name": message.text,
+        "files": []
+    }
+    await message.reply(f"Anime set to: **{message.text}**\n\nNow send me the **Background Image**.")
 
 @app.on_message(filters.photo & filters.private)
-async def handle_images(client, message: Message):
-    if message.from_user.id not in ADMIN_IDS:
+async def handle_photos(client, message: Message):
+    if str(message.from_user.id) != ADMIN_ID:
         return
-    
-    user_id = message.from_user.id
-    if user_id not in user_states:
-        await message.reply("❌ Use /create <anime_name> first!")
-        return
-    
-    state = user_states[user_id]
-    
-    # Download image
+
+    session = admin_sessions.get(ADMIN_ID)
+    if not session:
+        return await message.reply("Send me the Anime Name first bro!")
+
+    step = session["step"]
+    msg = await message.reply("Downloading image...")
     file_path = await message.download()
-    img = Image.open(file_path).convert('RGB')
-    os.remove(file_path)
-    
-    # Process based on current state
-    if state.background is None:
-        state.background = img
-        await message.reply(
-            "✅ Background received!\n\n"
-            "📤 Now send the **right thumbnail** (main anime poster)"
-        )
-    
-    elif state.right_thumbnail is None:
-        state.right_thumbnail = img
-        await message.reply(
-            "✅ Right thumbnail received!\n\n"
-            "📤 Now send the **left thumbnail** (main character image for phone mockup)"
-        )
-    
-    elif state.left_thumbnail is None:
-        state.left_thumbnail = img
+    session["files"].append(file_path)
+
+    if step == 1:
+        session["step"] = 2
+        await msg.edit("✅ Background saved!\n\nNow send the **Left Character Image**.")
+    elif step == 2:
+        session["step"] = 3
+        await msg.edit("✅ Left Character saved!\n\nNow send the **Right Thumbnail Image**.")
+    elif step == 3:
+        await msg.edit("✅ All images received! Generating your thumbnail, wait a few seconds...")
         
-        # All images received, create thumbnail
-        status_msg = await message.reply("⏳ Creating thumbnail... Please wait!")
-        
+        # Generate the thumbnail
+        out_file = "final_thumbnail.png"
         try:
-            result = create_thumbnail(
-                state.anime_name,
-                state.background,
-                state.right_thumbnail,
-                state.left_thumbnail
+            create_thumbnail(
+                name=session["name"],
+                bg_path=session["files"][0],
+                left_path=session["files"][1],
+                right_path=session["files"][2],
+                output_path=out_file
             )
             
-            # Save to buffer
-            output = BytesIO()
-            result.save(output, format='JPEG', quality=95)
-            output.seek(0)
-            
-            await message.reply_photo(
-                photo=output,
-                caption=f"✨ **{state.anime_name}** Thumbnail Ready!\n\n"
-                        f"Made with ❤️ by Kenshin Anime"
-            )
-            
-            await status_msg.delete()
-            
-            # Clean up state
-            del user_states[user_id]
-            
+            # Send it back
+            await message.reply_photo(photo=out_file, caption=f"Thumbnail ready for **{session['name']}**! 🚀")
         except Exception as e:
-            await status_msg.edit(f"❌ Error creating thumbnail: {str(e)}")
-            del user_states[user_id]
-
-
-@app.on_message(filters.command("cancel") & filters.private)
-async def cancel(client, message: Message):
-    if message.from_user.id in user_states:
-        del user_states[message.from_user.id]
-        await message.reply("❌ Thumbnail creation cancelled!")
-    else:
-        await message.reply("No active thumbnail creation process.")
-
+            await msg.edit(f"❌ Error making thumbnail: {e}")
+        finally:
+            # Clean up local files so your server doesn't get full
+            for f in session["files"]:
+                if os.path.exists(f): os.remove(f)
+            if os.path.exists(out_file): os.remove(out_file)
+            admin_sessions.pop(ADMIN_ID, None) # Reset session
 
 if __name__ == "__main__":
-    print("🚀 Kenshin Anime Thumbnail Bot Starting...")
+    print("Bot is running...")
     app.run()
