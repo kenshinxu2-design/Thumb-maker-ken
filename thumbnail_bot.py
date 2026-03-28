@@ -26,39 +26,63 @@ os.makedirs("fonts", exist_ok=True)
 FONT_URLS = {
     # Bebas Neue  → bold condensed caps  (title / genres / rating)
     "bebas": [
-        "https://raw.githubusercontent.com/google/fonts/main/ofl/bebasneuepro/BebasNeuePro-Regular.ttf",
-        "https://raw.githubusercontent.com/dharmatype/Bebas-Neue/master/Fonts/BN_ttf/BebasNeue-Regular.ttf",
+        "https://cdn.jsdelivr.net/fontsource/fonts/bebas-neue@latest/latin-400-normal.ttf",
+        "https://github.com/google/fonts/raw/refs/heads/main/ofl/bebasneuepro/BebasNeuePro-Regular.ttf",
     ],
     # Oswald Bold → synopsis body text
     "oswald": [
-        "https://raw.githubusercontent.com/google/fonts/main/ofl/oswald/static/Oswald-Bold.ttf",
+        "https://cdn.jsdelivr.net/fontsource/fonts/oswald@latest/latin-700-normal.ttf",
+        "https://github.com/google/fonts/raw/refs/heads/main/ofl/oswald/static/Oswald-Bold.ttf",
     ],
     # Satisfy     → "KENSHIN ANIME" script at bottom
     "satisfy": [
-        "https://raw.githubusercontent.com/google/fonts/main/ofl/satisfy/Satisfy-Regular.ttf",
+        "https://cdn.jsdelivr.net/fontsource/fonts/satisfy@latest/latin-400-normal.ttf",
+        "https://github.com/google/fonts/raw/refs/heads/main/ofl/satisfy/Satisfy-Regular.ttf",
     ],
 }
 
 def ensure_fonts():
+    os.makedirs("fonts", exist_ok=True)
     for name, urls in FONT_URLS.items():
         path = f"fonts/{name}.ttf"
-        if os.path.exists(path):
+        if os.path.exists(path) and os.path.getsize(path) > 1000:
+            print(f"[Font] {name} already exists ✓")
             continue
+        downloaded = False
         for url in urls:
             try:
-                print(f"[Font] Downloading {name}...")
-                r = requests.get(url, timeout=30)
+                print(f"[Font] Downloading {name} from {url[:60]}...")
+                r = requests.get(url, timeout=40, headers={"User-Agent": "Mozilla/5.0"})
                 r.raise_for_status()
-                open(path, "wb").write(r.content)
-                print(f"[Font] {name} ✓")
+                if len(r.content) < 1000:
+                    print(f"[Font] {name} response too small, skipping...")
+                    continue
+                with open(path, "wb") as f:
+                    f.write(r.content)
+                print(f"[Font] {name} ✓ ({len(r.content)//1024}KB)")
+                downloaded = True
                 break
             except Exception as e:
-                print(f"[Font] {url[:55]}... failed: {e}")
-        else:
-            print(f"[Font] ⚠️  {name} download failed — bot may crash!")
+                print(f"[Font] {url[:60]}... failed: {e}")
+        if not downloaded:
+            print(f"[Font] ⚠️  {name} download failed — will use fallback font")
 
 def fnt(name: str, size: int) -> ImageFont.FreeTypeFont:
-    return ImageFont.truetype(f"fonts/{name}.ttf", size)
+    path = f"fonts/{name}.ttf"
+    if os.path.exists(path) and os.path.getsize(path) > 1000:
+        return ImageFont.truetype(path, size)
+    # Fallback: system fonts so bot never crashes
+    fallbacks = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+        "/usr/share/fonts/truetype/ttf-bitstream-vera/Vera.ttf",
+    ]
+    for fb in fallbacks:
+        if os.path.exists(fb):
+            print(f"[Font] Using system fallback: {fb}")
+            return ImageFont.truetype(fb, size)
+    return ImageFont.load_default()
 
 # ── State Machine ─────────────────────────────────────────────────────────────
 states: dict = {}   # uid → { step, data }
