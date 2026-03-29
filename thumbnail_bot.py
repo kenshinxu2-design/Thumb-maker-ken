@@ -1,4 +1,4 @@
-import os, re, html, asyncio
+import os, re, html, asyncio, urllib.parse
 import aiohttp
 from pyrogram import Client, filters
 from pyrogram.types import Message, InputMediaPhoto
@@ -8,10 +8,11 @@ API_ID    = int(os.environ["API_ID"])
 API_HASH  = os.environ["API_HASH"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_IDS = list(map(int, os.environ.get("ADMIN_IDS", "").split(",")))
-PINTEREST_TOKEN = os.environ.get("PINTEREST_TOKEN", "")
 
 app = Client("kenshin_info_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-HEADERS = {"User-Agent": "KenshinAnimeBot/3.0"}
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36"
+}
 
 # ── AniList ───────────────────────────────────────────────────────────────────
 ANILIST_Q = """
@@ -50,7 +51,76 @@ async def fetch_anilist(name: str) -> dict | None:
         print(f"[AniList] {e}")
         return None
 
-# ── Jikan ─────────────────────────────────────────────────────────────────────
+# ── Wallhaven (best HD wallpapers, free) ──────────────────────────────────────
+async def fetch_wallhaven(query: str) -> list:
+    urls = []
+    queries = [query, f"{query} season 2"]
+    async with aiohttp.ClientSession(headers=HEADERS) as s:
+        for q in queries:
+            try:
+                async with s.get(
+                    "https://wallhaven.cc/api/v1/search",
+                    params={
+                        "q": q,
+                        "categories": "010",   # anime only
+                        "purity": "100",        # SFW only
+                        "sorting": "relevance",
+                        "order": "desc",
+                        "page": "1",
+                    },
+                    timeout=aiohttp.ClientTimeout(total=12),
+                ) as r:
+                    if r.status == 200:
+                        d = await r.json()
+                        for pin in (d.get("data") or []):
+                            path = pin.get("path")
+                            if path:
+                                urls.append(path)
+                        print(f"[Wallhaven] '{q}' → {len(d.get('data') or [])} results")
+                    else:
+                        print(f"[Wallhaven] {r.status} for '{q}'")
+            except Exception as e:
+                print(f"[Wallhaven] {e}")
+    return urls
+
+# ── Safebooru (anime art/fan art, free) ───────────────────────────────────────
+async def fetch_safebooru(query: str) -> list:
+    urls = []
+    # Convert query to booru tags format
+    tag = query.lower().strip().replace(" ", "_")
+    try:
+        async with aiohttp.ClientSession(headers=HEADERS) as s:
+            async with s.get(
+                "https://safebooru.org/index.php",
+                params={
+                    "page": "dapi",
+                    "s": "post",
+                    "q": "index",
+                    "tags": tag,
+                    "json": "1",
+                    "limit": "30",
+                },
+                timeout=aiohttp.ClientTimeout(total=12),
+            ) as r:
+                if r.status == 200:
+                    posts = await r.json(content_type=None)
+                    if isinstance(posts, list):
+                        for p in posts:
+                            img = p.get("sample_url") or p.get("file_url")
+                            if img:
+                                if img.startswith("//"):
+                                    img = "https:" + img
+                                urls.append(img)
+                        print(f"[Safebooru] '{tag}' → {len(urls)} results")
+                    else:
+                        print(f"[Safebooru] Unexpected response type")
+                else:
+                    print(f"[Safebooru] {r.status}")
+    except Exception as e:
+        print(f"[Safebooru] {e}")
+    return urls
+
+# ── Jikan/MAL ─────────────────────────────────────────────────────────────────
 async def fetch_jikan_pictures(mal_id: int) -> list:
     urls = []
     try:
@@ -65,77 +135,9 @@ async def fetch_jikan_pictures(mal_id: int) -> list:
                         lg = item.get("jpg", {}).get("large_image_url")
                         if lg:
                             urls.append(lg)
-            await asyncio.sleep(0.4)
-            async with s.get(
-                f"https://api.jikan.moe/v4/anime/{mal_id}/characters",
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as r:
-                if r.status == 200:
-                    d = await r.json()
-                    for char in (d.get("data") or [])[:8]:
-                        img = (char.get("character") or {}).get("images", {}).get("jpg", {}).get("image_url")
-                        if img:
-                            urls.append(img)
     except Exception as e:
         print(f"[Jikan] {e}")
     return urls
-
-# ── Pinterest ─────────────────────────────────────────────────────────────────
-async def fetch_pinterest(query: str, count: int = 30) -> list:
-    if not PINTEREST_TOKEN:
-        return []
-    urls = []
-    # Search multiple queries for more variety
-    queries = [
-        query,
-        f"{query} anime wallpaper",
-        f"{query} season 2",
-        f"{query} 4k art",
-        f"{query} fan art",
-    ]
-    seen = set()
-    async with aiohttp.ClientSession() as s:
-        for q in queries:
-            if len(urls) >= count:
-                break
-            try:
-                async with s.get(
-                    "https://api.pinterest.com/v5/search/pins",
-                    params={"query": q, "page_size": "25"},
-                    headers={
-                        "Authorization": f"Bearer {PINTEREST_TOKEN}",
-                        "Content-Type": "application/json",
-                    },
-                    timeout=aiohttp.ClientTimeout(total=12),
-                ) as r:
-                    if r.status != 200:
-                        print(f"[Pinterest] {r.status} for query: {q}")
-                        continue
-                    d = await r.json()
-                    items = d.get("items") or []
-                    for pin in items:
-                        media = pin.get("media") or {}
-                        # Try images dict first
-                        images = media.get("images") or {}
-                        img_url = None
-                        # Priority: 1200x > 736x > 600x > original
-                        for size in ("1200x", "736x", "600x", "150x150"):
-                            if images.get(size, {}).get("url"):
-                                img_url = images[size]["url"]
-                                break
-                        # Fallback: media_type == image
-                        if not img_url:
-                            img_url = (media.get("cover_image_url") or
-                                       pin.get("alt_text") and None or
-                                       None)
-                        if img_url and img_url not in seen:
-                            seen.add(img_url)
-                            urls.append(img_url)
-                await asyncio.sleep(0.3)
-            except Exception as e:
-                print(f"[Pinterest] query '{q}' error: {e}")
-    print(f"[Pinterest] Total fetched: {len(urls)}")
-    return urls[:count]
 
 # ── Kitsu ─────────────────────────────────────────────────────────────────────
 async def fetch_kitsu_images(name: str) -> list:
@@ -155,7 +157,7 @@ async def fetch_kitsu_images(name: str) -> list:
             attrs = item.get("attributes", {})
             for key in ("coverImage", "posterImage"):
                 img = attrs.get(key) or {}
-                for size in ("original", "large", "medium"):
+                for size in ("original", "large"):
                     if img.get(size):
                         urls.append(img[size])
                         break
@@ -210,22 +212,27 @@ def format_info(media: dict) -> str:
 
 async def is_valid_image(session: aiohttp.ClientSession, url: str) -> bool:
     try:
-        async with session.head(url, timeout=aiohttp.ClientTimeout(total=6), allow_redirects=True) as r:
+        async with session.head(
+            url, timeout=aiohttp.ClientTimeout(total=7),
+            allow_redirects=True, headers=HEADERS
+        ) as r:
             ct = r.headers.get("content-type", "")
-            return r.status == 200 and "image" in ct
+            return r.status == 200 and ("image" in ct or url.endswith((".jpg", ".jpeg", ".png", ".webp")))
     except:
         return False
 
-# ── Handlers ──────────────────────────────────────────────────────────────────
+# ── Bot Handlers ──────────────────────────────────────────────────────────────
 @app.on_message(filters.command("start") & filters.private)
 async def cmd_start(_, msg: Message):
     if msg.from_user.id not in ADMIN_IDS:
         return
     await msg.reply(
-        "**🎌 Kenshin Anime Info Bot v3**\n\n"
-        "Bas anime ka naam bhejo — main:\n"
-        "• Full info dunga (genres, rating, synopsis)\n"
-        "• Pinterest + MAL + Kitsu se cool images bhejunga\n\n"
+        "**🎌 Kenshin Anime Info Bot v4**\n\n"
+        "Bas anime ka naam bhejo:\n"
+        "• Full info (genres, rating, synopsis)\n"
+        "• HD wallpapers from Wallhaven\n"
+        "• Fan art from Safebooru\n"
+        "• Official art from MAL + Kitsu\n\n"
         "_Example:_ `Solo Leveling` ya `Trigun Stampede`"
     )
 
@@ -237,29 +244,28 @@ async def on_anime_name(_, msg: Message):
     name = msg.text.strip()
     wait = await msg.reply(f"🔍 Searching **{name}**...")
 
-    # Fetch all sources in parallel
-    media_task      = asyncio.create_task(fetch_anilist(name))
-    pinterest_task  = asyncio.create_task(fetch_pinterest(name))
-    kitsu_task      = asyncio.create_task(fetch_kitsu_images(name))
+    # Run AniList + Wallhaven + Safebooru + Kitsu in parallel
+    media_task     = asyncio.create_task(fetch_anilist(name))
+    wallhaven_task = asyncio.create_task(fetch_wallhaven(name))
+    safebooru_task = asyncio.create_task(fetch_safebooru(name))
+    kitsu_task     = asyncio.create_task(fetch_kitsu_images(name))
 
-    media = await media_task
+    media, wallhaven_imgs, safebooru_imgs, kitsu_imgs = await asyncio.gather(
+        media_task, wallhaven_task, safebooru_task, kitsu_task
+    )
+
     if not media:
         await wait.edit("❌ Anime nahi mila!\nSpelling check kar ya English title try kar.")
         return
 
     mal_id = media.get("idMal")
+    await wait.edit("📸 MAL images fetch ho rahi hain...")
+    jikan_imgs = await fetch_jikan_pictures(mal_id) if mal_id else []
 
-    await wait.edit("📸 Images collect ho rahi hain (Pinterest + MAL + Kitsu)...")
-
-    # Jikan needs mal_id so run after anilist
-    jikan_task = asyncio.create_task(fetch_jikan_pictures(mal_id)) if mal_id else None
-
-    pinterest_imgs, kitsu_imgs = await asyncio.gather(pinterest_task, kitsu_task)
-    jikan_imgs = await jikan_task if jikan_task else []
-
-    # Collect all image URLs
+    # Collect: Wallhaven first (best quality), then fan art, then official
     image_urls = []
-    # AniList cover + banner first
+
+    # AniList cover + banner
     cover = media.get("coverImage") or {}
     for key in ("extraLarge", "large"):
         if cover.get(key):
@@ -268,41 +274,43 @@ async def on_anime_name(_, msg: Message):
     if media.get("bannerImage"):
         image_urls.append(media["bannerImage"])
 
-    # Pinterest first (best quality/latest)
-    image_urls.extend(pinterest_imgs)
-    # Then Jikan official art
-    image_urls.extend(jikan_imgs)
-    # Then Kitsu
-    image_urls.extend(kitsu_imgs)
+    image_urls.extend(wallhaven_imgs)   # HD wallpapers
+    image_urls.extend(safebooru_imgs)   # Fan art
+    image_urls.extend(jikan_imgs)       # Official MAL
+    image_urls.extend(kitsu_imgs)       # Kitsu posters
 
     # Deduplicate
-    seen, unique_urls = set(), []
+    seen, unique = set(), []
     for u in image_urls:
         if u and u not in seen:
             seen.add(u)
-            unique_urls.append(u)
+            unique.append(u)
 
-    await wait.edit(f"🖼️ Validating {len(unique_urls)} images...")
+    total_found = len(unique)
+    await wait.edit(f"🖼️ {total_found} images mili! Validate ho rahi hain...")
 
-    # Validate up to 50 URLs
+    # Validate up to 60 URLs in parallel
     valid_urls = []
-    check = unique_urls[:50]
+    check = unique[:60]
     async with aiohttp.ClientSession(headers=HEADERS) as session:
-        results = await asyncio.gather(*[is_valid_image(session, u) for u in check], return_exceptions=True)
+        results = await asyncio.gather(
+            *[is_valid_image(session, u) for u in check],
+            return_exceptions=True
+        )
         for url, ok in zip(check, results):
             if ok is True:
                 valid_urls.append(url)
 
     await wait.delete()
 
-    # Send info + first image
     info_text = format_info(media)
+
     if valid_urls:
         try:
             await msg.reply_photo(valid_urls[0], caption=info_text)
         except Exception:
             await msg.reply(info_text)
-        # Remaining in batches of 10
+
         remaining = valid_urls[1:]
         for i in range(0, len(remaining), 10):
             batch = remaining[i:i+10]
@@ -321,10 +329,19 @@ async def on_anime_name(_, msg: Message):
                         pass
     else:
         await msg.reply(info_text)
+        await msg.reply("⚠️ Koi valid image nahi mili. Dusra naam try kar.")
+        return
 
-    await msg.reply(f"✅ Done! **{len(valid_urls)}** images bheji `{name}` ke liye. 🔥")
+    src_info = (
+        f"📊 **Sources:**\n"
+        f"🖼️ Wallhaven: `{len(wallhaven_imgs)}`\n"
+        f"🎨 Safebooru: `{len(safebooru_imgs)}`\n"
+        f"📺 MAL: `{len(jikan_imgs)}`\n"
+        f"✅ **Total sent: {len(valid_urls)} images**"
+    )
+    await msg.reply(src_info)
 
 # ── Entry ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    print("🚀 Kenshin Anime Info Bot v3 start ho raha hai...")
+    print("🚀 Kenshin Anime Info Bot v4 start ho raha hai...")
     app.run()
