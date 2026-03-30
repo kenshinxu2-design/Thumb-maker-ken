@@ -615,7 +615,7 @@ async def on_search(_, msg: Message):
                 await wait.edit(f"👤 Found: **{char_name}** | Fetching images...")
 
                 char_img = (char.get("images") or {}).get("jpg", {}).get("image_url") or                            (char.get("images") or {}).get("webp", {}).get("image_url")
-                char_pics_task = asyncio.create_task(fetch_character_pictures(char_id) if char_id else asyncio.sleep(0, result=[]))
+                char_pics_task = asyncio.create_task(fetch_character_pictures(char_id)) if char_id else asyncio.create_task(asyncio.sleep(0))
                 wh_t = asyncio.create_task(src_wallhaven(char_name, pages=6))
                 sb_t = asyncio.create_task(src_safebooru(char_name))
                 gb_t = asyncio.create_task(src_gelbooru(char_name))
@@ -648,14 +648,16 @@ async def on_search(_, msg: Message):
     # ── Normal parallel search ─────────────────────────────────────────────────
     anime_task = asyncio.create_task(fetch_anilist(query))
     char_task  = asyncio.create_task(search_character(query))
-    media, char = await asyncio.gather(anime_task, char_task)
+    results_gather = await asyncio.gather(anime_task, char_task, return_exceptions=True)
+    media = results_gather[0] if isinstance(results_gather[0], dict) else None
+    char  = results_gather[1] if isinstance(results_gather[1], dict) else None
 
     # ── Determine mode ────────────────────────────────────────────────────────
     is_char_search = False
     if char and not media:
         is_char_search = True
     elif char and media:
-        char_name_str  = (char.get("name") or {}).get("full") or ""
+        char_name_str   = (char.get("name") or {}).get("full") or ""
         anime_title_str = (media.get("title") or {}).get("english") or ""
         def sim(a: str, b: str) -> int:
             a, b = a.lower(), b.lower()
@@ -676,7 +678,7 @@ async def on_search(_, msg: Message):
                    (char.get("images") or {}).get("webp", {}).get("image_url")
 
         # Run all image sources in parallel
-        char_pics_task  = asyncio.create_task(fetch_character_pictures(char_id) if char_id else asyncio.coroutine(lambda: [])())
+        char_pics_task  = asyncio.create_task(fetch_character_pictures(char_id) if char_id else asyncio.sleep(0))
         wallhaven_task  = asyncio.create_task(src_wallhaven(char_name, pages=6))
         safebooru_task  = asyncio.create_task(src_safebooru(char_name))
         gelbooru_task   = asyncio.create_task(src_gelbooru(char_name))
@@ -769,7 +771,7 @@ async def on_search(_, msg: Message):
     yd_task  = asyncio.create_task(src_yandere(anime_title))
     zc_task  = asyncio.create_task(src_zerochan(anime_title))
     db_task  = asyncio.create_task(src_danbooru(anime_title))
-    jk_task  = asyncio.create_task(src_jikan(mal_id) if mal_id else asyncio.coroutine(lambda: [])())
+    jk_task  = asyncio.create_task(src_jikan(mal_id) if mal_id else asyncio.sleep(0))
     kt_task  = asyncio.create_task(src_kitsu(query))
 
     results = await asyncio.gather(
