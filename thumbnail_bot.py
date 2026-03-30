@@ -1,347 +1,340 @@
-import os, re, html, asyncio, urllib.parse
+import os
+import re
+import io
+import base64
+import asyncio
+from pathlib import Path
+from datetime import datetime
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
+import requests
 import aiohttp
-from pyrogram import Client, filters
-from pyrogram.types import Message, InputMediaPhoto
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ConversationHandler, ContextTypes
 
-# ── Config ────────────────────────────────────────────────────────────────────
-API_ID    = int(os.environ["API_ID"])
-API_HASH  = os.environ["API_HASH"]
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-ADMIN_IDS = list(map(int, os.environ.get("ADMIN_IDS", "").split(",")))
+# Environment variables
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_IDS = [int(id_) for id_ in os.getenv("ADMIN_IDS", "").split(",") if id_]
 
-app = Client("kenshin_info_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36"
-}
+# States for conversation
+ANIME_NAME, BG_IMAGE, MAIN_IMAGE, RIGHT1_IMAGE, RIGHT2_IMAGE = range(5)
 
-# ── AniList ───────────────────────────────────────────────────────────────────
-ANILIST_Q = """
-query($s:String){
-  Media(search:$s, type:ANIME){
-    idMal
-    title{ english romaji }
-    genres
-    description(asHtml:false)
-    averageScore
-    episodes
-    status
-    season
-    seasonYear
-    studios(isMain:true){ nodes{ name } }
-    coverImage{ extraLarge large }
-    bannerImage
-    trailer{ site id }
-  }
-}
+# Paths
+BASE_DIR = Path(__file__).parent
+CHANNEL_LOGO_PATH = BASE_DIR / "channel_logo.png"
+FONT_REGULAR = BASE_DIR / "OpenSans-Regular.ttf"
+FONT_BOLD = BASE_DIR / "OpenSans-Bold.ttf"
+
+# Default Telegram logo (base64 encoded small PNG)
+TELEGRAM_LOGO_BASE64 = """
+iVBORw0KGgoAAAANSUhEUgAAADIAAAAyCAYAAAAeP4ixAAAACXBIWXMAAAsTAAALEwEAmpwYAAAA
+... (truncated for brevity, full base64 would be here) ...
 """
+# In a real implementation you would include the full base64 string of a small Telegram logo.
+# For now we'll use a placeholder. You can generate your own using an online tool.
 
-async def fetch_anilist(name: str) -> dict | None:
-    try:
-        async with aiohttp.ClientSession(headers=HEADERS) as s:
-            async with s.post(
-                "https://graphql.anilist.co",
-                json={"query": ANILIST_Q, "variables": {"s": name}},
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as r:
-                if r.status != 200:
-                    return None
-                d = await r.json()
-        return (d.get("data") or {}).get("Media")
-    except Exception as e:
-        print(f"[AniList] {e}")
-        return None
+# If you prefer to have a file, uncomment below:
+# TELEGRAM_LOGO_PATH = BASE_DIR / "telegram_logo.png"
 
-# ── Wallhaven (best HD wallpapers, free) ──────────────────────────────────────
-async def fetch_wallhaven(query: str) -> list:
-    urls = []
-    queries = [query, f"{query} season 2"]
-    async with aiohttp.ClientSession(headers=HEADERS) as s:
-        for q in queries:
-            try:
-                async with s.get(
-                    "https://wallhaven.cc/api/v1/search",
-                    params={
-                        "q": q,
-                        "categories": "010",   # anime only
-                        "purity": "100",        # SFW only
-                        "sorting": "relevance",
-                        "order": "desc",
-                        "page": "1",
-                    },
-                    timeout=aiohttp.ClientTimeout(total=12),
-                ) as r:
-                    if r.status == 200:
-                        d = await r.json()
-                        for pin in (d.get("data") or []):
-                            path = pin.get("path")
-                            if path:
-                                urls.append(path)
-                        print(f"[Wallhaven] '{q}' → {len(d.get('data') or [])} results")
-                    else:
-                        print(f"[Wallhaven] {r.status} for '{q}'")
-            except Exception as e:
-                print(f"[Wallhaven] {e}")
-    return urls
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
 
-# ── Safebooru (anime art/fan art, free) ───────────────────────────────────────
-async def fetch_safebooru(query: str) -> list:
-    urls = []
-    # Convert query to booru tags format
-    tag = query.lower().strip().replace(" ", "_")
-    try:
-        async with aiohttp.ClientSession(headers=HEADERS) as s:
-            async with s.get(
-                "https://safebooru.org/index.php",
-                params={
-                    "page": "dapi",
-                    "s": "post",
-                    "q": "index",
-                    "tags": tag,
-                    "json": "1",
-                    "limit": "30",
-                },
-                timeout=aiohttp.ClientTimeout(total=12),
-            ) as r:
-                if r.status == 200:
-                    posts = await r.json(content_type=None)
-                    if isinstance(posts, list):
-                        for p in posts:
-                            img = p.get("sample_url") or p.get("file_url")
-                            if img:
-                                if img.startswith("//"):
-                                    img = "https:" + img
-                                urls.append(img)
-                        print(f"[Safebooru] '{tag}' → {len(urls)} results")
-                    else:
-                        print(f"[Safebooru] Unexpected response type")
-                else:
-                    print(f"[Safebooru] {r.status}")
-    except Exception as e:
-        print(f"[Safebooru] {e}")
-    return urls
-
-# ── Jikan/MAL ─────────────────────────────────────────────────────────────────
-async def fetch_jikan_pictures(mal_id: int) -> list:
-    urls = []
-    try:
-        async with aiohttp.ClientSession(headers=HEADERS) as s:
-            async with s.get(
-                f"https://api.jikan.moe/v4/anime/{mal_id}/pictures",
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as r:
-                if r.status == 200:
-                    d = await r.json()
-                    for item in (d.get("data") or []):
-                        lg = item.get("jpg", {}).get("large_image_url")
-                        if lg:
-                            urls.append(lg)
-    except Exception as e:
-        print(f"[Jikan] {e}")
-    return urls
-
-# ── Kitsu ─────────────────────────────────────────────────────────────────────
-async def fetch_kitsu_images(name: str) -> list:
-    urls = []
-    try:
-        async with aiohttp.ClientSession(headers=HEADERS) as s:
-            async with s.get(
-                "https://kitsu.io/api/edge/anime",
-                params={"filter[text]": name, "page[limit]": "3"},
-                headers={"Accept": "application/vnd.api+json"},
-                timeout=aiohttp.ClientTimeout(total=12),
-            ) as r:
-                if r.status != 200:
-                    return []
-                d = await r.json()
-        for item in (d.get("data") or []):
-            attrs = item.get("attributes", {})
-            for key in ("coverImage", "posterImage"):
-                img = attrs.get(key) or {}
-                for size in ("original", "large"):
-                    if img.get(size):
-                        urls.append(img[size])
-                        break
-    except Exception as e:
-        print(f"[Kitsu] {e}")
-    return urls
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def clean_desc(text: str, limit: int = 900) -> str:
-    text = re.sub(r"<[^>]+>", "", text or "")
-    text = html.unescape(text).strip()
-    text = re.sub(r"\(Source:[^)]+\)", "", text).strip()
-    text = re.sub(r"\s+", " ", text)
-    if len(text) > limit:
-        text = text[:limit].rsplit(" ", 1)[0] + "..."
-    return text
-
-def stars(rating: float) -> str:
-    filled = max(0, min(5, round(rating / 2)))
-    return "⭐" * filled + "☆" * (5 - filled)
-
-def format_info(media: dict) -> str:
-    title  = media["title"].get("english") or media["title"].get("romaji") or "Unknown"
-    genres = " | ".join(media.get("genres") or [])
-    score  = media.get("averageScore") or 0
-    rating = round(score / 10, 1)
-    eps    = media.get("episodes") or "?"
-    status = (media.get("status") or "").replace("_", " ").title()
-    season = f"{(media.get('season') or '').title()} {media.get('seasonYear') or ''}".strip()
-    nodes  = (media.get("studios") or {}).get("nodes") or []
-    studio = nodes[0]["name"] if nodes else "Unknown"
-    desc   = clean_desc(media.get("description") or "")
-    trailer = ""
-    tr = media.get("trailer") or {}
-    if tr.get("site") == "youtube" and tr.get("id"):
-        trailer = f"\n🎬 **Trailer:** https://youtu.be/{tr['id']}"
-    return (
-        f"🎌 **{title}**\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🎭 **Genres:** `{genres}`\n"
-        f"⭐ **Rating:** {stars(rating)} `{rating}/10`\n"
-        f"📺 **Episodes:** `{eps}`\n"
-        f"📡 **Status:** `{status}`\n"
-        f"🗓️ **Season:** `{season}`\n"
-        f"🏢 **Studio:** `{studio}`\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📖 **Synopsis:**\n{desc}"
-        f"{trailer}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📺 **KenshinAnime** | @kenshin\\_anime"
-    )
-
-async def is_valid_image(session: aiohttp.ClientSession, url: str) -> bool:
-    try:
-        async with session.head(
-            url, timeout=aiohttp.ClientTimeout(total=7),
-            allow_redirects=True, headers=HEADERS
-        ) as r:
-            ct = r.headers.get("content-type", "")
-            return r.status == 200 and ("image" in ct or url.endswith((".jpg", ".jpeg", ".png", ".webp")))
-    except:
-        return False
-
-# ── Bot Handlers ──────────────────────────────────────────────────────────────
-@app.on_message(filters.command("start") & filters.private)
-async def cmd_start(_, msg: Message):
-    if msg.from_user.id not in ADMIN_IDS:
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("⛔ You are not authorized to use this bot.")
         return
-    await msg.reply(
-        "**🎌 Kenshin Anime Info Bot v4**\n\n"
-        "Bas anime ka naam bhejo:\n"
-        "• Full info (genres, rating, synopsis)\n"
-        "• HD wallpapers from Wallhaven\n"
-        "• Fan art from Safebooru\n"
-        "• Official art from MAL + Kitsu\n\n"
-        "_Example:_ `Solo Leveling` ya `Trigun Stampede`"
+    await update.message.reply_text(
+        "🎬 Welcome to Anime Thumbnail Bot!\n"
+        "Send me the anime name to begin."
     )
+    return ANIME_NAME
 
-@app.on_message(filters.text & filters.private & ~filters.command(["start"]))
-async def on_anime_name(_, msg: Message):
-    if msg.from_user.id not in ADMIN_IDS:
-        return
+async def get_anime_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["anime_name"] = update.message.text.strip()
+    await update.message.reply_text("📷 Now send the background image (any photo).")
+    return BG_IMAGE
 
-    name = msg.text.strip()
-    wait = await msg.reply(f"🔍 Searching **{name}**...")
+async def get_bg_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.photo:
+        await update.message.reply_text("Please send a photo.")
+        return BG_IMAGE
+    file_id = update.message.photo[-1].file_id
+    file = await context.bot.get_file(file_id)
+    path = BASE_DIR / f"bg_{update.effective_user.id}.jpg"
+    await file.download_to_drive(path)
+    context.user_data["bg_path"] = str(path)
+    await update.message.reply_text("🖼️ Send the main character image.")
+    return MAIN_IMAGE
 
-    # Run AniList + Wallhaven + Safebooru + Kitsu in parallel
-    media_task     = asyncio.create_task(fetch_anilist(name))
-    wallhaven_task = asyncio.create_task(fetch_wallhaven(name))
-    safebooru_task = asyncio.create_task(fetch_safebooru(name))
-    kitsu_task     = asyncio.create_task(fetch_kitsu_images(name))
+async def get_main_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.photo:
+        await update.message.reply_text("Please send a photo.")
+        return MAIN_IMAGE
+    file_id = update.message.photo[-1].file_id
+    file = await context.bot.get_file(file_id)
+    path = BASE_DIR / f"main_{update.effective_user.id}.jpg"
+    await file.download_to_drive(path)
+    context.user_data["main_path"] = str(path)
+    await update.message.reply_text("🖼️ Send the first right‑side image.")
+    return RIGHT1_IMAGE
 
-    media, wallhaven_imgs, safebooru_imgs, kitsu_imgs = await asyncio.gather(
-        media_task, wallhaven_task, safebooru_task, kitsu_task
-    )
+async def get_right1_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.photo:
+        await update.message.reply_text("Please send a photo.")
+        return RIGHT1_IMAGE
+    file_id = update.message.photo[-1].file_id
+    file = await context.bot.get_file(file_id)
+    path = BASE_DIR / f"right1_{update.effective_user.id}.jpg"
+    await file.download_to_drive(path)
+    context.user_data["right1_path"] = str(path)
+    await update.message.reply_text("🖼️ Send the second right‑side image.")
+    return RIGHT2_IMAGE
 
-    if not media:
-        await wait.edit("❌ Anime nahi mila!\nSpelling check kar ya English title try kar.")
-        return
+async def get_right2_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.photo:
+        await update.message.reply_text("Please send a photo.")
+        return RIGHT2_IMAGE
+    file_id = update.message.photo[-1].file_id
+    file = await context.bot.get_file(file_id)
+    path = BASE_DIR / f"right2_{update.effective_user.id}.jpg"
+    await file.download_to_drive(path)
+    context.user_data["right2_path"] = str(path)
 
-    mal_id = media.get("idMal")
-    await wait.edit("📸 MAL images fetch ho rahi hain...")
-    jikan_imgs = await fetch_jikan_pictures(mal_id) if mal_id else []
+    # All images collected, now generate thumbnail
+    await update.message.reply_text("✨ Generating thumbnail... Please wait.")
 
-    # Collect: Wallhaven first (best quality), then fan art, then official
-    image_urls = []
+    anime_name = context.user_data["anime_name"]
+    anime_info = await fetch_anime_info(anime_name)
 
-    # AniList cover + banner
-    cover = media.get("coverImage") or {}
-    for key in ("extraLarge", "large"):
-        if cover.get(key):
-            image_urls.append(cover[key])
-            break
-    if media.get("bannerImage"):
-        image_urls.append(media["bannerImage"])
-
-    image_urls.extend(wallhaven_imgs)   # HD wallpapers
-    image_urls.extend(safebooru_imgs)   # Fan art
-    image_urls.extend(jikan_imgs)       # Official MAL
-    image_urls.extend(kitsu_imgs)       # Kitsu posters
-
-    # Deduplicate
-    seen, unique = set(), []
-    for u in image_urls:
-        if u and u not in seen:
-            seen.add(u)
-            unique.append(u)
-
-    total_found = len(unique)
-    await wait.edit(f"🖼️ {total_found} images mili! Validate ho rahi hain...")
-
-    # Validate up to 60 URLs in parallel
-    valid_urls = []
-    check = unique[:60]
-    async with aiohttp.ClientSession(headers=HEADERS) as session:
-        results = await asyncio.gather(
-            *[is_valid_image(session, u) for u in check],
-            return_exceptions=True
+    try:
+        thumbnail_path = await generate_thumbnail(
+            bg_path=context.user_data["bg_path"],
+            main_path=context.user_data["main_path"],
+            right1_path=context.user_data["right1_path"],
+            right2_path=context.user_data["right2_path"],
+            anime_info=anime_info,
+            channel_logo_path=CHANNEL_LOGO_PATH if CHANNEL_LOGO_PATH.exists() else None
         )
-        for url, ok in zip(check, results):
-            if ok is True:
-                valid_urls.append(url)
+        with open(thumbnail_path, "rb") as f:
+            await update.message.reply_photo(photo=f, caption="🎉 Your thumbnail is ready!")
+        # Clean up temporary files
+        for key in ["bg_path", "main_path", "right1_path", "right2_path"]:
+            path = context.user_data.get(key)
+            if path and os.path.exists(path):
+                os.remove(path)
+        os.remove(thumbnail_path)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
+    finally:
+        context.user_data.clear()
+    return ConversationHandler.END
 
-    await wait.delete()
-
-    info_text = format_info(media)
-
-    if valid_urls:
-        try:
-            await msg.reply_photo(valid_urls[0], caption=info_text)
-        except Exception:
-            await msg.reply(info_text)
-
-        remaining = valid_urls[1:]
-        for i in range(0, len(remaining), 10):
-            batch = remaining[i:i+10]
-            if not batch:
-                break
-            try:
-                await msg.reply_media_group([InputMediaPhoto(u) for u in batch])
-                await asyncio.sleep(1.2)
-            except Exception as e:
-                print(f"[MediaGroup] {e}")
-                for u in batch:
-                    try:
-                        await msg.reply_photo(u)
-                        await asyncio.sleep(0.5)
-                    except:
-                        pass
-    else:
-        await msg.reply(info_text)
-        await msg.reply("⚠️ Koi valid image nahi mili. Dusra naam try kar.")
+async def set_logo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Command to set the channel logo (only admin)."""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("⛔ You are not authorized.")
         return
+    if not update.message.photo:
+        await update.message.reply_text("Please send an image as the logo.")
+        return
+    file_id = update.message.photo[-1].file_id
+    file = await context.bot.get_file(file_id)
+    await file.download_to_drive(CHANNEL_LOGO_PATH)
+    await update.message.reply_text("✅ Channel logo updated!")
 
-    src_info = (
-        f"📊 **Sources:**\n"
-        f"🖼️ Wallhaven: `{len(wallhaven_imgs)}`\n"
-        f"🎨 Safebooru: `{len(safebooru_imgs)}`\n"
-        f"📺 MAL: `{len(jikan_imgs)}`\n"
-        f"✅ **Total sent: {len(valid_urls)} images**"
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("You are not authorized.")
+        return
+    context.user_data.clear()
+    await update.message.reply_text("Operation cancelled.")
+    return ConversationHandler.END
+
+async def fetch_anime_info(anime_name: str):
+    """Fetch details from Jikan API."""
+    async with aiohttp.ClientSession() as session:
+        url = f"https://api.jikan.moe/v4/anime?q={anime_name}&limit=1"
+        try:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data["data"]:
+                        anime = data["data"][0]
+                        title = anime.get("title", anime_name)
+                        synopsis = anime.get("synopsis", "No synopsis available.")
+                        genres = ", ".join([g["name"] for g in anime.get("genres", [])]) or "N/A"
+                        rating = anime.get("score", "N/A")
+                        if rating != "N/A":
+                            rating = f"{rating}/10"
+                        # Try to extract season from title or aired dates
+                        season_str = ""
+                        if "season" in anime:
+                            season = anime["season"]
+                            year = anime.get("year", "")
+                            if season and year:
+                                season_str = f"{season.capitalize()} {year}"
+                        # Fallback: search for "Season X" in title
+                        if not season_str:
+                            match = re.search(r"(?:Season|S)\s*(\d+)", title, re.I)
+                            if match:
+                                season_str = f"SEASON-{int(match.group(1)):02d}"
+                            else:
+                                season_str = "SEASON-??"
+                        return {
+                            "title": title,
+                            "synopsis": synopsis,
+                            "genres": genres,
+                            "rating": rating,
+                            "season": season_str
+                        }
+        except Exception:
+            pass
+    # Fallback
+    return {
+        "title": anime_name,
+        "synopsis": "No synopsis available.",
+        "genres": "N/A",
+        "rating": "N/A",
+        "season": "SEASON-??"
+    }
+
+async def generate_thumbnail(bg_path, main_path, right1_path, right2_path, anime_info, channel_logo_path=None):
+    """Compose the final thumbnail."""
+    # Dimensions
+    W, H = 1200, 675
+    # Load background
+    bg = Image.open(bg_path).convert("RGBA").resize((W, H))
+    # Semi‑transparent overlay
+    overlay = Image.new("RGBA", (W, H), (0, 0, 0, 180))
+    bg = Image.alpha_composite(bg, overlay)
+
+    # Load main character image
+    main = Image.open(main_path).convert("RGBA")
+    main_size = (300, 300)
+    main.thumbnail(main_size, Image.Resampling.LANCZOS)
+    # Create rounded rectangle mask
+    mask = Image.new("L", main.size, 0)
+    draw = ImageDraw.Draw(mask)
+    draw.rounded_rectangle((0, 0, main.size[0], main.size[1]), radius=30, fill=255)
+    main.putalpha(mask)
+    bg.paste(main, (40, H//2 - main.size[1]//2), main)
+
+    # Load right images
+    right1 = Image.open(right1_path).convert("RGBA")
+    right1_size = (250, 250)
+    right1.thumbnail(right1_size, Image.Resampling.LANCZOS)
+    right2 = Image.open(right2_path).convert("RGBA")
+    right2.thumbnail(right1_size, Image.Resampling.LANCZOS)
+    # Position: x = 900, y = 80 for first, y = 380 for second
+    bg.paste(right1, (W - right1.size[0] - 40, 80), right1)
+    bg.paste(right2, (W - right2.size[0] - 40, 380), right2)
+
+    # Channel logo (top right)
+    if channel_logo_path and os.path.exists(channel_logo_path):
+        logo = Image.open(channel_logo_path).convert("RGBA")
+        logo.thumbnail((60, 60), Image.Resampling.LANCZOS)
+        bg.paste(logo, (W - logo.size[0] - 20, 20), logo)
+
+    # Draw text
+    draw = ImageDraw.Draw(bg)
+    try:
+        font_bold = ImageFont.truetype(str(FONT_BOLD), 28)
+        font_reg = ImageFont.truetype(str(FONT_REGULAR), 20)
+        font_small = ImageFont.truetype(str(FONT_REGULAR), 18)
+    except:
+        font_bold = ImageFont.load_default()
+        font_reg = ImageFont.load_default()
+        font_small = ImageFont.load_default()
+
+    # Anime title
+    title = anime_info["title"]
+    title_x = 40
+    title_y = H - 200
+    draw.text((title_x, title_y), title, fill="white", font=font_bold)
+
+    # Line under title
+    draw.line((title_x, title_y + 35, title_x + 300, title_y + 35), fill="white", width=2)
+
+    # Genres
+    genres = anime_info["genres"]
+    genres_y = title_y + 50
+    draw.text((title_x, genres_y), genres, fill="white", font=font_reg)
+
+    # Synopsis (wrap)
+    synopsis = anime_info["synopsis"]
+    max_width = 500
+    lines = []
+    words = synopsis.split()
+    line = ""
+    for word in words:
+        test_line = f"{line} {word}".strip()
+        bbox = draw.textbbox((0, 0), test_line, font=font_small)
+        if bbox[2] - bbox[0] <= max_width:
+            line = test_line
+        else:
+            lines.append(line)
+            line = word
+    if line:
+        lines.append(line)
+    synopsis_y = genres_y + 40
+    for line in lines[:3]:  # max 3 lines
+        draw.text((title_x, synopsis_y), line, fill="white", font=font_small)
+        synopsis_y += 28
+
+    # Rating and season (side by side)
+    rating = anime_info["rating"]
+    season = anime_info["season"]
+    rating_text = f"★ {rating}" if rating != "N/A" else "N/A"
+    season_text = season
+    draw.text((title_x, synopsis_y + 10), rating_text, fill="white", font=font_bold)
+    draw.text((title_x + 200, synopsis_y + 10), season_text, fill="white", font=font_bold)
+
+    # Bottom left branding: "KENSHIN ANIME" + Telegram logo
+    # For Telegram logo, we could use a base64 image or a file.
+    # Here we'll just draw text; if you have the logo, paste it.
+    brand_text = "KENSHIN ANIME"
+    text_width = draw.textlength(brand_text, font=font_bold)
+    draw.text((40, H - 50), brand_text, fill="white", font=font_bold)
+    # Placeholder for Telegram logo – if you have it, paste:
+    # logo_telegram = Image.open(...).resize((30,30))
+    # bg.paste(logo_telegram, (40 + text_width + 5, H - 45), logo_telegram)
+
+    # Convert to RGB and save
+    final = bg.convert("RGB")
+    output_path = BASE_DIR / f"thumbnail_{datetime.now().timestamp()}.jpg"
+    final.save(output_path, "JPEG")
+    return str(output_path)
+
+def main():
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    # Conversation handler
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            ANIME_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_anime_name)],
+            BG_IMAGE: [MessageHandler(filters.PHOTO, get_bg_image)],
+            MAIN_IMAGE: [MessageHandler(filters.PHOTO, get_main_image)],
+            RIGHT1_IMAGE: [MessageHandler(filters.PHOTO, get_right1_image)],
+            RIGHT2_IMAGE: [MessageHandler(filters.PHOTO, get_right2_image)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
     )
-    await msg.reply(src_info)
 
-# ── Entry ─────────────────────────────────────────────────────────────────────
+    app.add_handler(conv_handler)
+    app.add_handler(CommandHandler("setlogo", set_logo))
+    # Optional: help command
+    app.add_handler(CommandHandler("help", lambda u,c: u.message.reply_text(
+        "Commands:\n"
+        "/start – begin creating a thumbnail\n"
+        "/setlogo – set your channel logo (send an image after the command)\n"
+        "/cancel – cancel current operation"
+    )))
+
+    print("Bot started...")
+    app.run_polling()
+
 if __name__ == "__main__":
-    print("🚀 Kenshin Anime Info Bot v4 start ho raha hai...")
-    app.run()
+    main()
