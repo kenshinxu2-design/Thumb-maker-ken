@@ -1,1 +1,1 @@
-worker: python thumbnail_bot.py
+worker: python bot.py
