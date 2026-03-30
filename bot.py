@@ -334,7 +334,20 @@ async def search_character(name: str):
                 results = d.get("data") or []
                 if not results: return None
                 item = results[0]
-                return item if isinstance(item, dict) else None
+                if not isinstance(item, dict): return None
+                # Jikan v4: fetch full character details for anime list + about
+                char_id = item.get("mal_id")
+                if char_id:
+                    await asyncio.sleep(0.4)
+                    async with s.get(
+                        f"https://api.jikan.moe/v4/characters/{char_id}",
+                        timeout=aiohttp.ClientTimeout(total=12),
+                    ) as r2:
+                        if r2.status == 200:
+                            cd = await r2.json()
+                            full = cd.get("data")
+                            return full if isinstance(full, dict) else item
+                return item
     except Exception as e:
         print(f"[CharSearch] {e}")
         return None
@@ -445,19 +458,32 @@ def format_anime_info(media: dict) -> str:
     )
 
 def format_char_info(char: dict) -> str:
-    name     = char.get("name") or {}
-    fullname = name.get("full") or name.get("first") or "Unknown"
-    nick     = name.get("nicknames") or []
-    nick_str = f" _({', '.join(nick[:3])})_" if nick else ""
+    # Jikan v4: "name" is a plain string, not a dict
+    raw_name = char.get("name") or "Unknown"
+    fullname = raw_name if isinstance(raw_name, str) else (
+        raw_name.get("full") or raw_name.get("first") or "Unknown"
+    )
+    nick     = char.get("nicknames") or []
+    nick_str = f" _({', '.join(nick[:3])})_" if isinstance(nick, list) and nick else ""
     about    = clean_desc(char.get("about") or "No info available.")
     animes   = char.get("anime") or []
     anime_list = ""
     if animes:
         titles = []
         for a in animes[:5]:
-            t = (a.get("anime") or {}).get("title") or {}
-            titles.append(t.get("english") or t.get("romaji") or "")
-        anime_list = "\n🎌 **Appears in:** " + " | ".join(filter(None, titles))
+            if not isinstance(a, dict): continue
+            anime_obj = a.get("anime") or {}
+            if isinstance(anime_obj, dict):
+                title_obj = anime_obj.get("title") or {}
+                if isinstance(title_obj, dict):
+                    t = title_obj.get("english") or title_obj.get("romaji") or ""
+                elif isinstance(title_obj, str):
+                    t = title_obj
+                else:
+                    t = ""
+                if t: titles.append(t)
+        if titles:
+            anime_list = "\n🎌 **Appears in:** " + " | ".join(titles)
     fav = char.get("favorites") or 0
     return (
         f"👤 **{fullname}**{nick_str}\n━━━━━━━━━━━━━━━━━━━━\n"
@@ -595,7 +621,9 @@ async def _handle_search(msg: Message):
     if char and not media:
         is_char = True
     elif char and media:
-        char_full  = ((char.get("name") or {}).get("full") or "").lower()
+        raw_cname  = char.get("name") or ""
+        char_full  = (raw_cname if isinstance(raw_cname, str) else
+                      raw_cname.get("full") or raw_cname.get("first") or "").lower()
         anime_name = ((media.get("title") or {}).get("english") or
                       (media.get("title") or {}).get("romaji") or "").lower()
         q_lower    = query.lower()
@@ -671,8 +699,10 @@ async def _handle_search(msg: Message):
 
 async def _send_character(msg: Message, wait: Message, char: dict, query: str):
     char_id  = char.get("mal_id")
-    name_d   = char.get("name") or {}
-    char_name = name_d.get("full") or name_d.get("first") or query
+    raw_name  = char.get("name") or query
+    char_name = raw_name if isinstance(raw_name, str) else (
+        raw_name.get("full") or raw_name.get("first") or query
+    )
     await wait.edit(f"👤 **{char_name}** mila! Images fetch ho rahi hain...")
 
     char_img = (char.get("images") or {}).get("jpg", {}).get("image_url") or \
