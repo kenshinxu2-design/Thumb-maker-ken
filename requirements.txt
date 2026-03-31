@@ -1,3 +1,4 @@
-pyrogram==2.0.106
-TgCrypto
-aiohttp>=3.9.0
+pyrofork
+aiohttp
+Pillow
+tgcrypto
